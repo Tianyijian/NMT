@@ -90,3 +90,22 @@ def train_decoder(encoder_out):
     return rnn()
 
 
+# 定义训练网络
+def train_model():
+    encoder_out = encoder()
+    rnn_out = train_decoder(encoder_out)
+    label = fluid.layers.data(name="target_language_next_word", shape=[1], dtype='int64', lod_level=1)
+    # 定义损失函数
+    cost = fluid.layers.cross_entropy(input=rnn_out, label=label)
+    avg_cost = fluid.layers.mean(cost)
+    return avg_cost
+
+
+# 定义优化器
+def optimizer_func():
+    # 设置梯度裁剪
+    fluid.clip.set_gradient_clip(clip=fluid.clip.GradientClipByGlobalNorm(clip_norm=5.0))
+    # 定义先增后降的学习率策略 Noam 衰减方法
+    lr_decay = fluid.layers.learning_rate_scheduler.noam_decay(hidden_dim, 1000)
+    return fluid.optimizer.Adam(learning_rate=lr_decay,
+                                regularization=fluid.regularizer.L2DecayRegularizer(regularization_coeff=1e-4))
