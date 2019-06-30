@@ -6,6 +6,9 @@ source_dict_size = target_dict_size = dict_size  # 源/目标语言字典大小
 word_dim = 512  # 词向量维度
 hidden_dim = 512  # 编码器中的隐层大小
 decoder_size = hidden_dim  # 解码器中的隐层大小
+max_length = 256 # 解码生成句子的最大长度
+beam_size = 4  # beam search的柱宽度
+batch_size = 64  # batch 中的样本数
 
 is_sparse = True  # 代表是否用稀疏更新的标志
 
@@ -109,3 +112,92 @@ def optimizer_func():
     lr_decay = fluid.layers.learning_rate_scheduler.noam_decay(hidden_dim, 1000)
     return fluid.optimizer.Adam(learning_rate=lr_decay,
                                 regularization=fluid.regularizer.L2DecayRegularizer(regularization_coeff=1e-4))
+
+
+# 预测模式下基于beam search的解码器
+def infer_decoder(encoder_out):
+    # 获取编码器输出的最后一步并进行非线性映射以构造解码器RNN的初始状态
+    encoder_last = fluid.layers.sequence_last_step(input=encoder_out)
+    encoder_last_proj = fluid.layers.fc(
+        input=encoder_last, size=decoder_size, act='tanh')
+    # 编码器输出在attention中计算结果的cache
+    encoder_out_proj = fluid.layers.fc(
+        input=encoder_out, size=decoder_size, bias_attr=False)
+
+    # 最大解码步数
+    max_len = fluid.layers.fill_constant(shape=[1], dtype='int64', value=max_length)
+    # 解码步数计算变量
+    counter = fluid.layers.zeros(shape=[1], dtype='int64', force_cpu=True)
+
+    # 定义 tensor array 用以保存各个时间步的内容，并写入初始id，score和state
+    init_ids = fluid.layers.data(
+        name="init_ids", shape=[1], dtype="int64", lod_level=2)
+    init_scores = fluid.layers.data(
+        name="init_scores", shape=[1], dtype="float32", lod_level=2)
+    ids_array = fluid.layers.array_write(init_ids, i=counter)
+    scores_array = fluid.layers.array_write(init_scores, i=counter)
+    state_array = fluid.layers.array_write(encoder_last_proj, i=counter)
+
+    # 定义循环终止条件变量
+    cond = fluid.layers.less_than(x=counter, y=max_len)
+    while_op = fluid.layers.While(cond=cond)
+    with while_op.block():
+        # 获取解码器在当前步的输入，包括上一步选择的id，对应的score和上一步的state
+        pre_ids = fluid.layers.array_read(array=ids_array, i=counter)
+        pre_score = fluid.layers.array_read(array=scores_array, i=counter)
+        pre_state = fluid.layers.array_read(array=state_array, i=counter)
+
+        # 同train_decoder中的内容，进行RNN的单步计算
+        pre_ids_emb = fluid.layers.embedding(
+            input=pre_ids,
+            size=[target_dict_size, word_dim],
+            dtype='float32',
+            is_sparse=is_sparse)
+        out, current_state = cell(pre_ids_emb, pre_state, encoder_out,
+                            encoder_out_proj)
+        prob = fluid.layers.fc(
+            input=current_state, size=target_dict_size, act='softmax')
+
+        # 计算累计得分，进行beam search
+        topk_scores, topk_indices = fluid.layers.topk(prob, k=beam_size)
+        accu_scores = fluid.layers.elementwise_add(
+            x=fluid.layers.log(topk_scores),
+            y=fluid.layers.reshape(pre_score, shape=[-1]),
+            axis=0)
+        accu_scores = fluid.layers.lod_reset(x=accu_scores, y=pre_ids)
+        selected_ids, selected_scores = fluid.layers.beam_search(
+            pre_ids, pre_score, topk_indices, accu_scores, beam_size, end_id=1)
+
+        fluid.layers.increment(x=counter, value=1, in_place=True)
+        # 将 search 结果写入 tensor array 中
+        fluid.layers.array_write(selected_ids, array=ids_array, i=counter)
+        fluid.layers.array_write(selected_scores, array=scores_array, i=counter)
+        # sequence_expand 作为 gather 使用以获取search结果对应的状态，并更新
+        current_state = fluid.layers.sequence_expand(current_state,
+                                                     selected_ids)
+        fluid.layers.array_write(current_state, array=state_array, i=counter)
+        current_enc_out = fluid.layers.sequence_expand(encoder_out,
+                                                       selected_ids)
+        fluid.layers.assign(current_enc_out, encoder_out)
+        current_enc_out_proj = fluid.layers.sequence_expand(
+            encoder_out_proj, selected_ids)
+        fluid.layers.assign(current_enc_out_proj, encoder_out_proj)
+
+        # 更新循环终止条件
+        length_cond = fluid.layers.less_than(x=counter, y=max_len)
+        finish_cond = fluid.layers.logical_not(
+            fluid.layers.is_empty(x=selected_ids))
+        fluid.layers.logical_and(x=length_cond, y=finish_cond, out=cond)
+
+    # 根据保存的每一步的结果，回溯生成最终解码结果
+    translation_ids, translation_scores = fluid.layers.beam_search_decode(
+        ids=ids_array, scores=scores_array, beam_size=beam_size, end_id=1)
+
+    return translation_ids, translation_scores
+
+
+# 定义预测网络
+def infer_model():
+    encoder_out = encoder()
+    translation_ids, translation_scores = infer_decoder(encoder_out)
+    return translation_ids, translation_scores
