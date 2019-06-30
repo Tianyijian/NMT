@@ -1,3 +1,6 @@
+import os
+import six
+
 import paddle
 import paddle.fluid as fluid
 
@@ -6,11 +9,12 @@ source_dict_size = target_dict_size = dict_size  # 源/目标语言字典大小
 word_dim = 512  # 词向量维度
 hidden_dim = 512  # 编码器中的隐层大小
 decoder_size = hidden_dim  # 解码器中的隐层大小
-max_length = 256 # 解码生成句子的最大长度
+max_length = 256  # 解码生成句子的最大长度
 beam_size = 4  # beam search的柱宽度
 batch_size = 64  # batch 中的样本数
 
 is_sparse = True  # 代表是否用稀疏更新的标志
+model_save_dir = "inference.model"
 
 
 # 编码器框架
@@ -154,7 +158,7 @@ def infer_decoder(encoder_out):
             dtype='float32',
             is_sparse=is_sparse)
         out, current_state = cell(pre_ids_emb, pre_state, encoder_out,
-                            encoder_out_proj)
+                                  encoder_out_proj)
         prob = fluid.layers.fc(
             input=current_state, size=target_dict_size, act='softmax')
 
@@ -201,3 +205,48 @@ def infer_model():
     encoder_out = encoder()
     translation_ids, translation_scores = infer_decoder(encoder_out)
     return translation_ids, translation_scores
+
+
+# 定义训练program
+def train(use_cuda):
+    train_prog = fluid.Program()
+    startup_prog = fluid.Program()
+    with fluid.program_guard(train_prog, startup_prog):
+        with fluid.unique_name.guard():
+            avg_cost = train_model()
+            optimizer = optimizer_func()
+            optimizer.minimize(avg_cost)
+
+    # 定义训练数据生成器
+    train_data = paddle.batch(
+        paddle.reader.shuffle(
+            paddle.dataset.wmt16.train(source_dict_size, target_dict_size),
+            buf_size=10000),
+        batch_size=batch_size)
+
+    # 定义训练环境：使用的设备和执行器
+    place = fluid.CUDAPlace(0) if use_cuda else fluid.CPUPlace()
+    exe = fluid.Executor(place)
+
+    # DataFeeder完成
+    feeder = fluid.DataFeeder(
+        feed_list=[
+            'src_word_id', 'target_language_word', 'target_language_next_word'
+        ],
+        place=place,
+        program=train_prog)
+
+    # 执行初始化 Program，进行参数初始化
+    exe.run(startup_prog)
+    # 循环迭代执行训练
+    EPOCH_NUM = 2
+    for pass_id in six.moves.xrange(EPOCH_NUM):
+        batch_id = 0
+        for data in train_data():
+            cost = exe.run(
+                train_prog, feed=feeder.feed(data), fetch_list=[avg_cost])[0]
+            print('pass_id: %d, batch_id: %d, loss: %f' % (pass_id, batch_id,
+                                                           cost))
+            batch_id += 1
+        # 保存模型
+        fluid.io.save_params(exe, model_save_dir, main_program=train_prog)
